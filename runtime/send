@@ -1,0 +1,160 @@
+#==============================================================================
+# This script is used to trigger the sending of packets in RTL designs
+# "nexys_packet_demo" and "xuppl4_packet_demo".  It assumes you have the 
+# usual complement of FPGA utilities installed, notably "axireg" and "pcireg".
+#
+# The local directory should contain a file called "board_type".  The contents
+# of that file should be either "xuppl4" or "nexys_a7" (sans quotes)
+#
+# If you're running this on a Nexys-A7, move the two right-most slide-switches
+# into the "up" position to simulate PCS alignment on the two channels.
+#==============================================================================
+
+# Declare the register offsets
+REG_PACKET_COUNT=$((0*4))
+  REG_PACKET_LEN=$((1*4))
+ REG_IDLE_CYCLES=$((2*4))
+
+# Declare status register addresses
+REG_BUSY=0x3000
+ REG_PCS=0x3004
+
+#==============================================================================
+# Displays 0 for "nexys_a7" or 1 for "xuppl4"
+#==============================================================================
+get_board_type()
+{
+    local filename=board_type
+    if [ ! -f $filename ]; then
+        echo "File $filename not found." 1>&2
+        return 
+    fi
+
+    if [ $(cat $filename) == "xuppl4" ]; then
+        echo "1"
+        return
+    fi
+
+    if [ $(cat $filename) == "nexys_a7" ]; then
+        echo "0"
+        return
+    fi
+
+    echo "Unknown board type:" $(cat $filename) 1>&2
+    return 0
+}
+#==============================================================================
+
+
+#==============================================================================
+# axi() - Reads or writes a value to an AXI-addressable register
+#==============================================================================
+axi()
+{
+    if [ $board_type -eq 0 ]; then
+        axireg $1 $2 $3 $4 $5 $6
+    else
+        pcireg $1 $2 $3 $4 $5 $6
+    fi
+}
+#==============================================================================
+
+
+#==============================================================================
+# Displays usage text and exits
+#==============================================================================
+show_usage()
+{
+    echo Usage\:
+    echo send \<channel\> \<packet_count\> [packet_length] [inter-packet-gap]
+    echo
+    echo  channel = 0 or 1
+    echo  packet_count must be greater than 0
+    echo  packet_length must be between 1 and 9600
+    echo  inter-packet-gap is number of idle cycles between packets
+    exit 1
+}
+#==============================================================================
+
+
+# Fetch the board type.  1 = XUP-PL4, 0 = Nexys-A7
+export board_type=$(get_board_type)
+
+# If we have an unknown board type, call it quits
+test -z $board_type && exit 1
+
+
+#  If there are no command line parameters, show help
+if [ -z $1 ]; then
+    show_usage
+fi 
+
+# Make sure the user has done a hot-reset
+if [ $(axi -dec 0x0000) -eq $((0xFFFFFFFF)) ]; then
+    echo "You probably need to perform a hot_reset."
+    exit 1
+fi
+
+# Fetch parameters from the command line
+      channel=$1
+ packet_count=$2
+packet_length=$3
+          ipg=$4
+
+# Ensure we have a valid channel number
+if [ -z $channel ] || [ $channel -lt 0 ] || [ $channel -gt 1 ]; then
+    echo "Invalid channel number [$channel].  Must be 0 or 1."
+    exit 1
+fi
+
+# Is the specified channel already busy sending data?
+busy=$(($(axi -dec $REG_BUSY) & (1 << $channel)))
+
+# If this channel is already busy sending packets, bail
+if [ $busy -ne 0 ]; then
+    echo "Channel $channel is busy."
+    exit 1
+fi
+
+# Does the specified channel have PCS alignment?
+aligned=$(($(axi -dec $REG_PCS) & (1 << $channel)))
+
+# If this channel doesn't have PCS alignment, bail
+if [ $aligned -eq 0 ]; then
+    echo "No PCS alignment on channel $channel"
+    exit 1
+fi
+
+
+# Determine the base address of AXI registers for this channel
+test $channel -eq 0 && base_addr=0x1000
+test $channel -eq 1 && base_addr=0x2000
+
+# Ensure that the specified packet count is valid
+if [ -z $packet_count ] || [ $packet_count -lt 1 ]; then
+    echo "Invalid packet_count [$packet_count].  Must be greater than 0."
+    exit 1
+fi
+
+# If a packet length was provided...
+if [ "$packet_length" != "" ]; then
+
+    # If the packet length is illegal, complain
+    if [ $packet_length -lt 1 ] || [ $packet_length -gt 9600 ]; then
+        echo "Invalid packet_length [$packet_length].  Must be between 1 and 9600."
+        exit 1
+    fi
+
+    # Otherwise, set the packet-length register 
+    axi $((base_addr + REG_PACKET_LEN)) $packet_length
+fi
+
+
+# If an inter-packet-gap was provided, set the register value
+if [ ! -z $ipg ]; then
+    axi $((base_addr + REG_IDLE_CYCLES)) $ipg
+fi
+
+# And finally, start transferring packets
+axi $((base_addr + REG_PACKET_COUNT)) $packet_count
+
